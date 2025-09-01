@@ -1,184 +1,188 @@
 # -*- coding: utf-8 -*-
 """
-KDD para Abalone (Type ∈ {1,2,3})
-
-Etapas:
-1) Seleção & Entendimento dos Dados
-2) Pré-processamento (consistência de colunas, tratamento de NaN)
-3) Transformação (One-Hot em 'sex', padronização de numéricas)
-4) Modelagem (k-NN por padrão; opção SVM RBF)
-5) Avaliação (CV 10-fold, relatório por classe)
-6) Preparação para envio (alinha colunas/dummies e gera previsões)
+KDD Simplificado — Abalone
+- sex: M/F→A, I→I; depois A→1 e I→0 (numérico)
+- Remove linhas com zeros improváveis (length/diameter/height/weight)
+- Modelo direto (KNN por padrão; pode trocar para SVC)
+- CV 10-fold + relatório por classe
+- Imagens: confusion_matrix.png e correlation_matrix.png
+- Envio automático no final (padrão do curso)
 """
 
 from pathlib import Path
-import pandas as pd
 import numpy as np
+import pandas as pd
+import requests
+import matplotlib.pyplot as plt
 
 from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_val_predict
 from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
+# from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC 
 
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.svm import SVC
+# ----------------------------
+# CONFIG
+# ----------------------------
+TRAIN_PATH = Path("03_Validation/abalone_dataset.csv")
+APP_PATH   = Path("03_Validation/abalone_app.csv")
 
-# ============================
-# Função principal de KDD
-# ============================
-def run_kdd_abalone(
-    train_path: str | Path,
-    app_path: str | Path | None = None,
-    algo: str = "knn",           # "knn" (padrão) ou "svm"
-    knn_k: int = 5,              # vizinhos no k-NN
-    svm_c: float = 10.0,         # C do SVM RBF
-    n_folds: int = 10,
-    random_state: int = 42,
-):
-    """
-    Executa o pipeline KDD na base do Abalone e (opcionalmente) prevê no app.
+URL = "https://aydanomachado.com/mlclass/03_Validation.php"
+DEV_KEY = "VG" 
 
-    Retorna:
-        dict com métricas de CV, relatório por classe (texto), matriz de confusão (array),
-        modelo final treinado, transformador (ColumnTransformer) e previsões (se app_path fornecido).
-    """
-    train_path = Path(train_path)
-    if not train_path.exists():
-        raise FileNotFoundError(f"Arquivo de treino não encontrado: {train_path}")
+KNN_K = 5
+N_FOLDS = 10
+RANDOM_STATE = 42
 
-    # -------------------------
-    # 1) Seleção & Leitura
-    # -------------------------
-    df = pd.read_csv(train_path)
+# ----------------------------
+# Helpers
+# ----------------------------
+def map_sex_to_ai(series: pd.Series) -> pd.Series:
+    return series.map(lambda x: 'A' if x in ['M','F'] else ('I' if x == 'I' else x))
+
+def sex_ai_to_numeric(series: pd.Series) -> pd.Series:
+    return series.map({'A': 1, 'I': 0}).astype(float)
+
+def remove_zero_improvavel(df: pd.DataFrame, tol: float = 1e-9) -> pd.DataFrame:
+    """Remove linhas com zero em colunas físicas (robusto p/ string, -0.0, etc)."""
+    cols = list(df.columns)
+    phys_keys = ["length", "diameter", "height", "weight"]
+    phys_cols = [c for c in cols if any(k in c for k in phys_keys)]
+
+    for c in phys_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    zero_counts = {}
+    for c in phys_cols:
+        if c in df.columns:
+            cnt = int((df[c].abs() <= tol).fillna(False).sum())
+            zero_counts[c] = cnt
+
+    print(f" - Colunas com regra de zero (medidas físicas): {phys_cols}")
+    print(" - Linhas com zeros 'improváveis':")
+    if any(zero_counts.values()):
+        for col, val in zero_counts.items():
+            print(f"   {col}: {val}")
+    else:
+        print("   nenhuma")
+
+    mask_ok = np.ones(len(df), dtype=bool)
+    for c in phys_cols:
+        if c in df.columns:
+            mask_ok &= ~((df[c].abs() <= tol).fillna(False))
+
+    removed = int((~mask_ok).sum())
+    if removed:
+        print(f" - Removendo {removed} linhas com zeros improváveis.")
+    return df.loc[mask_ok].reset_index(drop=True)
+
+def plot_confusion(cm: np.ndarray, classes: list[str], out_path: Path):
+    plt.figure()
+    plt.imshow(cm, interpolation='nearest', aspect='auto', cmap='Blues')
+    plt.title('Matriz de Confusão (CV)')
+    plt.colorbar()
+    ticks = np.arange(len(classes))
+    plt.xticks(ticks, classes)
+    plt.yticks(ticks, classes)
+    thresh = cm.max() / 2.0 if cm.size else 0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, format(cm[i, j], 'd'),
+                     ha='center', va='center',
+                     color='white' if cm[i, j] > thresh else 'black')
+    plt.ylabel('Verdadeiro')
+    plt.xlabel('Predito')
+    plt.tight_layout()
+    plt.savefig(out_path, bbox_inches='tight', dpi=150)
+    plt.close()
+
+def plot_correlations(df_num: pd.DataFrame, out_path: Path):
+    corr = df_num.corr(numeric_only=True)
+    plt.figure(figsize=(6.5, 5.5))
+    plt.imshow(corr, interpolation='nearest', aspect='auto', cmap='Blues')
+    plt.title('Correlação entre variáveis numéricas')
+    plt.colorbar()
+    ticks = np.arange(len(corr.columns))
+    plt.xticks(ticks, corr.columns, rotation=45, ha='right')
+    plt.yticks(ticks, corr.columns)
+    plt.tight_layout()
+    plt.savefig(out_path, bbox_inches='tight', dpi=150)
+    plt.close()
+
+# ----------------------------
+# Main
+# ----------------------------
+def main():
+    # === Leitura treino
+    df = pd.read_csv(TRAIN_PATH)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    if "sex" not in df.columns or "type" not in df.columns:
-        raise ValueError("As colunas obrigatórias 'sex' e 'type' não foram encontradas no CSV.")
+    df["sex"] = map_sex_to_ai(df["sex"])
+    df["sex_num"] = sex_ai_to_numeric(df["sex"])
 
-    # -------------------------
-    # 2) Pré-processamento
-    # -------------------------
-    # Define colunas
-    target_col = "type"
-    cat_cols = ["sex"]
-    num_cols = [c for c in df.columns if c not in cat_cols + [target_col]]
+    target = "type"
+    num_cols = [c for c in df.columns if c not in [target, "sex"]]
 
-    # Se houver NaN: imputação simples
-    num_transform = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-    ])
-    cat_transform = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
-    ])
+    print("=== Diagnóstico rápido (treino) ===")
+    print(" - Nulos por coluna:")
+    for col, val in df.isna().sum().items():
+        print(f"   {col}: {val}")
+    df = remove_zero_improvavel(df)
+    print(f" - Linhas após limpeza: {len(df)}")
 
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", num_transform, num_cols),
-            ("cat", cat_transform, cat_cols),
-        ],
-        remainder="drop",
-    )
+    out_dir = TRAIN_PATH.parent
+    plot_correlations(df[num_cols], out_path=out_dir / "correlation_matrix.png")
+    print(f" - Heatmap de correlações salvo em: {out_dir/'correlation_matrix.png'}")
 
-    # -------------------------
-    # 3) Modelagem
-    # -------------------------
-    if algo.lower() == "svm":
-        clf = SVC(kernel="rbf", C=svm_c, gamma="scale", random_state=random_state)
-    else:
-        clf = KNeighborsClassifier(n_neighbors=knn_k)
+    # === Modelo
+    # model = KNeighborsClassifier(n_neighbors=KNN_K)
+    model = SVC(kernel='rbf', C=10.0, gamma='scale', random_state=RANDOM_STATE)
+    X, y = df[num_cols].copy(), df[target].astype(int)
 
-    pipe = Pipeline(steps=[
-        ("prep", preprocessor),
-        ("model", clf),
-    ])
+    cv = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy")
+    print(f" - Acurácia média (CV): {scores.mean():.4f} | desvio padrão: {scores.std():.4f}")
 
-    X = df.drop(columns=[target_col])
-    y = df[target_col].astype(int)
+    y_pred_cv = cross_val_predict(model, X, y, cv=cv)
+    print("=== Report por classe (CV) ===")
+    print(classification_report(y, y_pred_cv, digits=4))
 
-    # -------------------------
-    # 4) Avaliação (CV 10-fold)
-    # -------------------------
-    cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
-    scores = cross_val_score(pipe, X, y, cv=cv, scoring="accuracy")
-    y_pred_cv = cross_val_predict(pipe, X, y, cv=cv)
-
-    report_txt = classification_report(y, y_pred_cv, digits=4)
     cm = confusion_matrix(y, y_pred_cv)
+    print("Matriz de Confusão (CV):\n", cm)
+    plot_confusion(cm, classes=["1","2","3"], out_path=out_dir / "confusion_matrix.png")
+    print(f" - Matriz de confusão salva em: {out_dir/'confusion_matrix.png'}")
 
-    # -------------------------
-    # 5) Treino final (100%)
-    # -------------------------
-    pipe.fit(X, y)
+    # === Treino final
+    model.fit(X, y)
 
-    # -------------------------
-    # 6) (Opcional) Prever no APP
-    # -------------------------
-    preds_app = None
-    if app_path is not None:
-        app_path = Path(app_path)
-        if not app_path.exists():
-            raise FileNotFoundError(f"Arquivo de aplicação não encontrado: {app_path}")
-        df_app = pd.read_csv(app_path)
-        df_app.columns = [c.strip().lower().replace(" ", "_") for c in df_app.columns]
+    # === Aplicar no app
+    df_app = pd.read_csv(APP_PATH)
+    df_app.columns = [c.strip().lower().replace(" ", "_") for c in df_app.columns]
+    print(" - Nulos por coluna:")
+    for col, val in df_app.isna().sum().items():
+        print(f"   {col}: {val}")
+    df_app = remove_zero_improvavel(df_app)
+    print(f" - Linhas após limpeza: {len(df_app)}")
 
-        # Garante colunas essenciais
-        if "sex" not in df_app.columns:
-            raise ValueError("A coluna 'sex' não foi encontrada no arquivo de aplicação (app).")
+    df_app["sex"] = map_sex_to_ai(df_app["sex"])
+    df_app["sex_num"] = sex_ai_to_numeric(df_app["sex"])
 
-        # Seleciona apenas colunas conhecidas (numéricas + 'sex'); ignora 'type' se existir
-        use_cols = [c for c in df_app.columns if c in num_cols + cat_cols]
-        X_app = df_app[use_cols].copy()
+    X_app = df_app[[c for c in num_cols if c in df_app.columns]].copy()
+    X_app = remove_zero_improvavel(X_app)
 
-        preds_app = pipe.predict(X_app)  # rótulos 1/2/3
+    y_pred = model.predict(X_app)
+    print(f" - Total de previsões: {len(y_pred)} | Amostra 10: {y_pred[:10].tolist()}")
 
-    return {
-        "cv_accuracy_mean": float(scores.mean()),
-        "cv_accuracy_std": float(scores.std()),
-        "classification_report": report_txt,
-        "confusion_matrix": cm,
-        "final_model": pipe,
-        "numeric_columns": num_cols,
-        "categorical_columns": cat_cols,
-        "predictions_app": preds_app,  # None se app_path não for fornecido
-    }
+    # === Envio automático ===
+    print(" - Enviando para o servidor...")
+    # data = {
+    #     "dev_key": DEV_KEY,
+    #     "predictions": pd.Series(y_pred).to_json(orient="values")
+    # }
+    # r = requests.post(url=URL, data=data)
+    # print(" - Resposta do servidor:\n", r.text, "\n")
 
+    print("=== Concluído ===")
 
-# ============================
-# Exemplo de uso direto
-# ============================
 if __name__ == "__main__":
-    # Ajuste os caminhos conforme sua máquina/projeto
-    TRAIN = "03_Validation/abalone_dataset.csv"     # treino/validação
-    APP   = "03_Validation/abalone_app.csv"         # aplicação (para envio)
-
-    results = run_kdd_abalone(
-        train_path=TRAIN,
-        app_path=None,         # coloque APP se já tiver o arquivo de aplicação
-        algo="knn",            # "knn" (padrão) ou "svm"
-        knn_k=5,
-        svm_c=10.0,
-        n_folds=10,
-    )
-
-    print("\n=== Avaliação (CV 10-fold) ===")
-    print(f"Acurácia Média: {results['cv_accuracy_mean']:.4f}")
-    print(f"Desvio Padrão : {results['cv_accuracy_std']:.4f}")
-
-    print("\n=== Report por Classe (CV) ===")
-    print(results["classification_report"])
-
-    print("Matriz de Confusão (CV):")
-    print(results["confusion_matrix"])
-
-    # Caso queira prever no app, rode novamente com app_path=APP e salve para envio:
-    # results = run_kdd_abalone(TRAIN, APP, algo="knn", knn_k=5)
-    # preds = results["predictions_app"]
-    # pd.Series(preds, name="type").to_csv("predicoes_abalone_app.csv", index=False)
-    #
-    # Envio (fora deste script): poste 'predictions' como JSON conforme o enunciado:
-    # payload = {"dev_key": "Eneas", "predictions": pd.Series(preds).to_json(orient="values")}
-    # requests.post("https://aydanomachado.com/mlclass/03_Validation.php", data=payload)
+    main()
